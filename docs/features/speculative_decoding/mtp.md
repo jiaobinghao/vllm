@@ -37,6 +37,10 @@ targets. Upgrade to a version with Gemma 4 MTP support instead.
 
 ## Offline Example
 
+The MiMo examples on this page enable `trust_remote_code` to load the checkpoint's
+[custom configuration](https://huggingface.co/XiaomiMiMo/MiMo-7B-Base/blob/main/configuration_mimo.py).
+Review that code before enabling this option.
+
 ```python
 from vllm import LLM, SamplingParams
 
@@ -45,6 +49,7 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 llm = LLM(
     model="XiaomiMiMo/MiMo-7B-Base",
+    trust_remote_code=True,
     tensor_parallel_size=1,
     speculative_config={
         "method": "mtp",
@@ -64,8 +69,108 @@ for output in outputs:
 ```bash
 vllm serve XiaomiMiMo/MiMo-7B-Base \
     --tensor-parallel-size 1 \
+    --trust-remote-code \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
+
+## Dynamic MTP by batch size
+
+At high concurrency, MTP's drafting and verification work can cost more than the
+decode steps it saves. [Dynamic speculative decoding](dynamic_speculative_decoding.md)
+lets you reduce the draft depth as the scheduled batch grows, while retaining a
+larger depth for smaller batches.
+
+Choose a batch-size schedule by comparing three configurations with the same
+model, hardware, prompt and output lengths, sampling settings, and server limits.
+Record the vLLM version and model revision with the results:
+
+1. A baseline without `--speculative-config`.
+2. Fixed MTP depths, starting with `num_speculative_tokens=1` and then larger
+   values supported by the model.
+3. A dynamic schedule chosen from those measurements.
+
+### Dynamic MTP example
+
+The following schedule illustrates reducing the draft depth as the batch grows.
+The thresholds are examples, not recommended defaults or measured optima:
+
+```bash
+vllm serve XiaomiMiMo/MiMo-7B-Base \
+    --tensor-parallel-size 1 \
+    --trust-remote-code \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 2048 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 2048 \
+    --no-enable-prefix-caching \
+    --speculative-config '{
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+        "num_speculative_tokens_per_batch_size": [
+            [1, 4, 3],
+            [5, 16, 1],
+            [17, 64, 0]
+        ]
+    }'
+```
+
+Each inclusive range selects `K` from the number of requests scheduled in an
+engine step. This can differ from the client's concurrency limit as requests
+arrive, queue, and finish. Set `num_speculative_tokens` to at least the largest
+`K` in the table: it caps the effective draft depth.
+
+`K=0` stops proposing speculative tokens for that batch size. It does not unload
+the MTP weights or guarantee the same cost as starting without speculative
+decoding; the draft path can still perform work to maintain its state. Measure
+against the non-speculative baseline as well as fixed MTP depths.
+
+### Measure the tradeoff
+
+For a controlled comparison, restart the server with each configuration, keeping
+the other options above unchanged. Disabling prefix caching prevents repeated
+warmup prompts from turning measured requests into cache hits. Run a benchmark
+such as:
+
+```bash
+vllm bench serve \
+    --backend vllm \
+    --model XiaomiMiMo/MiMo-7B-Base \
+    --trust-remote-code \
+    --endpoint /v1/completions \
+    --dataset-name random \
+    --random-input-len 512 \
+    --random-output-len 128 \
+    --random-range-ratio 0.0 \
+    --num-prompts 128 \
+    --max-concurrency 8 \
+    --request-rate inf \
+    --num-warmups 16 \
+    --temperature 0 \
+    --ignore-eos \
+    --seed 0 \
+    --save-result \
+    --result-dir results \
+    --result-filename mtp-dynamic-c8-r1.json
+```
+
+Repeat at several concurrency levels, including values on both sides of each
+schedule boundary, and use a distinct result filename for each configuration
+and repetition. Compare output tokens/s and mean and tail time per output token
+(TPOT); check time to first token (TTFT), failed requests, and memory usage too.
+Repeat measurements and vary their order before choosing thresholds.
+
+Random prompts are useful for a repeatable load test, but their MTP acceptance
+can differ from real text. Confirm the selected schedule on representative
+prompts, using the [acceptance metrics](acceptance_metrics.md) alongside latency
+and throughput. Include a workload that drains from a large batch to a small
+one so that the schedule is exercised when `K` increases again.
+
+Dynamic speculative decoding is currently disabled with data parallelism
+(`--data-parallel-size > 1`); vLLM falls back to the static
+`num_speculative_tokens`. See the dynamic decoding guide's
+[limitations](dynamic_speculative_decoding.md#limitations) before deploying a
+schedule.
 
 ## Notes
 
